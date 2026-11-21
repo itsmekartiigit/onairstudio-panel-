@@ -1,0 +1,538 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { collection, doc, onSnapshot, query, where } from 'firebase/firestore';
+import { httpsCallable } from 'firebase/functions';
+import { deleteObject, getDownloadURL, ref, uploadBytes } from 'firebase/storage';
+import QRCode from 'qrcode';
+import { Album, ArrowLeft, Check, ChevronRight, Cloud, Copy, Download, ExternalLink, FileImage, FileVideo, Folder, Grid2X2, ImagePlus, Link2, List, LoaderCircle, MoreVertical, Plus, QrCode, Search, Settings2, Share2, Trash2, Upload, X, CheckCircle2, AlertTriangle, ScanLine, Clock3, RefreshCw, ArrowUpDown } from 'lucide-react';
+import { auth, db, functions, storage } from '../../Firebase';
+import { useStudio } from '../../context/StudioContext';
+import AlbumShareManager from '../AlbumShareManager';
+import { getAlbumViewUrl } from '../../services/albumShareUrl';
+
+type Row = { id: string; [key: string]: any };
+type AlbumUploadReservation = { mediaId: string; originalPath: string; folderId: string; uploadUrl?: string; storageProvider?: 'firebase' | 'r2'; uploaded: boolean };
+const call = async <T = any,>(name: string, data: Record<string, unknown>) => (await httpsCallable<Record<string, unknown>, T>(functions, name)(data)).data;
+const asDate = (value: any) => value?.toDate?.() ?? (value ? new Date(value) : null);
+const dateText = (value: any) => asDate(value)?.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }) ?? '—';
+const errorText = (error: any) => {
+  const message = error?.message?.replace(/^FirebaseError:\s*/, '') ?? 'Something went wrong. Please try again.';
+  const code = typeof error?.code === 'string' ? ` (${error.code})` : '';
+  return `${message}${code}`;
+};
+const bytesText = (bytes = 0) => bytes < 1024 ** 2 ? `${(bytes / 1024).toFixed(0)} KB` : `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+const sessionKey = 'onair_album_guest_session';
+const guestSession = () => { let id = localStorage.getItem(sessionKey); if (!id) { id = crypto.randomUUID().replace(/-/g, ''); localStorage.setItem(sessionKey, id); } return id; };
+const tabs = ['Folders', 'All Media', 'AI Photo Quality', 'Guest Selections', 'Album Settings', 'Share Album'] as const;
+
+export const AlbumSelectionPage: React.FC = () => {
+  const { walletBalance, notify } = useStudio();
+  const [plans, setPlans] = useState<Row[]>([]); const [subs, setSubs] = useState<Row[]>([]); const [albums, setAlbums] = useState<Row[]>([]);
+  const [loading, setLoading] = useState(true); const [busy, setBusy] = useState(false); const [error, setError] = useState('');
+  const [purchasePlan, setPurchasePlan] = useState<Row | null>(null); const [newAlbum, setNewAlbum] = useState(false); const [albumName, setAlbumName] = useState(''); const [creationDate, setCreationDate] = useState(new Date().toISOString().slice(0, 10)); const [albumCoverFile, setAlbumCoverFile] = useState<File | null>(null); const [albumCoverPreview, setAlbumCoverPreview] = useState('');
+  const [album, setAlbum] = useState<Row | null>(null); const [tab, setTab] = useState<(typeof tabs)[number]>('Folders'); const [folders, setFolders] = useState<Row[]>([]); const [media, setMedia] = useState<Row[]>([]); const [mediaCursor, setMediaCursor] = useState<string | null>(null); const [mediaLoading, setMediaLoading] = useState(false); const [activeFolder, setActiveFolder] = useState<Row | null>(null); const [selections, setSelections] = useState<Row[]>([]); const [selectedMediaIds, setSelectedMediaIds] = useState<Set<string>>(() => new Set()); const [deletingMediaIds, setDeletingMediaIds] = useState<Set<string>>(() => new Set());
+  const [aiSummary, setAiSummary] = useState<Row | null>(null); const [aiSummaryLoading, setAiSummaryLoading] = useState(false); const [aiFilter, setAiFilter] = useState('all'); const [aiSearch, setAiSearch] = useState(''); const [aiSort, setAiSort] = useState('newest'); const [aiListView, setAiListView] = useState(false);
+  const [folderDialog, setFolderDialog] = useState(false); const [folderName, setFolderName] = useState(''); const [settings, setSettings] = useState<any>(null); const [watermarkUrl, setWatermarkUrl] = useState(''); const [search, setSearch] = useState(''); const [albumSearch, setAlbumSearch] = useState(''); const [albumListView, setAlbumListView] = useState(false); const [mediaTypeFilter, setMediaTypeFilter] = useState('all'); const [listView, setListView] = useState(false); const [uploading, setUploading] = useState<Record<string, { percent: number; size: number }>>({}); const [failedUploads, setFailedUploads] = useState<File[]>([]); const [preview, setPreview] = useState<Row | null>(null); const [testingR2, setTestingR2] = useState(false);
+  const fileInput = useRef<HTMLInputElement>(null); const folderInput = useRef<HTMLInputElement>(null); const uploadRequests = useRef<Record<string, XMLHttpRequest>>({}); const createdFolders = useRef<Record<string, string>>({}); const uploadReservations = useRef(new WeakMap<File, AlbumUploadReservation>());
+  const uid = auth.currentUser?.uid;
+  useEffect(() => { if (settings?.watermarkPath) void getDownloadURL(ref(storage, settings.watermarkPath)).then(setWatermarkUrl).catch(() => setWatermarkUrl('')); else setWatermarkUrl(''); }, [settings?.watermarkPath]);
+  useEffect(() => () => { if (albumCoverPreview) URL.revokeObjectURL(albumCoverPreview); }, [albumCoverPreview]);
+
+  const uploadToR2 = (url: string, file: File, key: string, onProgress: (percent: number) => void) =>
+    new Promise<void>((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      uploadRequests.current[key] = xhr;
+      xhr.open('PUT', url);
+      xhr.setRequestHeader('Content-Type', file.type);
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable) onProgress(Math.round((event.loaded / event.total) * 100));
+      };
+      xhr.onload = () => {
+        delete uploadRequests.current[key];
+        console.log('R2 UPLOAD RESPONSE:', {
+          status: xhr.status,
+          statusText: xhr.statusText,
+          response: xhr.responseText,
+          contentType: file.type,
+        });
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve();
+        } else {
+          reject(new Error(`R2 upload failed: HTTP ${xhr.status} - ${xhr.responseText}`));
+        }
+      };
+      xhr.onerror = () => {
+        delete uploadRequests.current[key];
+        console.error('R2 NETWORK ERROR:', {
+          urlHost: new URL(url).host,
+          origin: window.location.origin,
+          contentType: file.type,
+          readyState: xhr.readyState,
+          status: xhr.status,
+        });
+        reject(new Error('R2 network/CORS error. Inspect OPTIONS and PUT in Network.'));
+      };
+      xhr.onabort = () => {
+        delete uploadRequests.current[key];
+        reject(new Error('Upload cancelled.'));
+      };
+      xhr.send(file);
+    });
+
+  useEffect(() => {
+    const offPlans = onSnapshot(
+      query(collection(db, 'albumPlans'), where('status', '==', 'active')),
+      (s) => setPlans(s.docs.map((d) => ({ id: d.id, ...d.data(), planName: d.data().planName ?? d.data().name, pricePerMonth: d.data().pricePerMonth ?? d.data().priceMonthly, storagePerMonthGB: d.data().storagePerMonthGB ?? d.data().storageGB } as Row))),
+      (listenerError) => { console.error('ALBUM PLANS ERROR:', listenerError.code, listenerError.message); setError(`Album plans could not load: ${listenerError.message}`); },
+    );
+    if (!uid) { setLoading(false); return () => offPlans(); }
+    const offSubs = onSnapshot(
+      query(collection(db, 'albumPlanSubscriptions'), where('studioId', '==', uid)),
+      (s) => { setSubs(s.docs.map((d) => ({ id: d.id, ...d.data() } as Row))); setLoading(false); },
+      (listenerError) => { console.error('ALBUM SUBSCRIPTIONS ERROR:', listenerError.code, listenerError.message); setSubs([]); setLoading(false); setError(`Album subscriptions could not load: ${listenerError.message}`); },
+    );
+    const offAlbums = onSnapshot(
+      query(collection(db, 'albums'), where('studioId', '==', uid)),
+      (s) => setAlbums(s.docs.map((d) => ({ id: d.id, ...d.data() } as Row)).sort((a, b) => (asDate(b.createdAt)?.getTime() ?? 0) - (asDate(a.createdAt)?.getTime() ?? 0))),
+      (listenerError) => { console.error('ALBUMS ERROR:', listenerError.code, listenerError.message); setAlbums([]); setLoading(false); setError(`Albums could not load: ${listenerError.message}`); },
+    );
+    return () => { offPlans(); offSubs(); offAlbums(); };
+  }, [uid]);
+
+  const subscription = subs.filter((s) => s.status === 'active' && (asDate(s.expirationDate ?? s.expiresAt)?.getTime() ?? 0) > Date.now()).sort((a, b) => (asDate(b.expirationDate ?? b.expiresAt)?.getTime() ?? 0) - (asDate(a.expirationDate ?? a.expiresAt)?.getTime() ?? 0))[0];
+  const hasExpired = !subscription && subs.some((s) => s.status === 'expired' || (s.status === 'active' && (asDate(s.expirationDate ?? s.expiresAt)?.getTime() ?? 0) <= Date.now()));
+  const albumIdFromUrl = new URLSearchParams(location.search).get('album');
+  useEffect(() => { if (albumIdFromUrl && albums.length) { const found = albums.find((a) => a.id === albumIdFromUrl); if (found) void openAlbum(found); } }, [albumIdFromUrl, albums.length]);
+  const openAlbum = async (item: Row) => { setAlbum(item); setFolders([]); setMedia([]); setMediaCursor(null); setSelectedMediaIds(new Set()); setDeletingMediaIds(new Set()); createdFolders.current = {}; setActiveFolder(null); setTab('Folders'); setSettings(item.settings ?? { photoSelectionLimit: 100, watermarkEnabled: false, watermarkPath: '', downloadEnabled: false, expirationDays: 365 }); history.replaceState(null, '', `?album=${encodeURIComponent(item.id)}`); };
+  useEffect(() => {
+    if (!album) return;
+    setMedia([]); setMediaCursor(null); setSelectedMediaIds(new Set());
+    let stale = false;
+    void call<{ folders: Row[] }>('getStudioAlbumFolders', { albumId: album.id })
+      .then((result) => { if (!stale) setFolders(result.folders); })
+      .catch((cause) => {
+        if (stale) return;
+        console.error('STUDIO ALBUM FOLDERS FUNCTION ERROR:', cause);
+        setFolders([]);
+        setError(`Album folders could not load: ${errorText(cause)}`);
+      });
+    const offAlbum = onSnapshot(
+      doc(db, 'albums', album.id),
+      (snapshot) => {
+        if (!snapshot.exists()) return;
+        const updated = { id: snapshot.id, ...snapshot.data() } as Row;
+        setAlbum((current) => current?.id === updated.id ? { ...current, ...updated } : current);
+        setAlbums((current) => current.map((item) => item.id === updated.id ? { ...item, ...updated } : item));
+      },
+      (listenerError) => console.error('ALBUM SUMMARY ERROR:', listenerError.code, listenerError.message),
+    );
+    setMediaLoading(true);
+    void call<{ media: Row[]; nextCursor: string | null }>('getStudioAlbumMedia', { albumId: album.id })
+      .then((result) => {
+        if (stale) return;
+        setMedia(result.media);
+        setMediaCursor(result.nextCursor);
+        setError('');
+      })
+      .catch((cause) => {
+        if (stale) return;
+        console.error('STUDIO ALBUM MEDIA FUNCTION ERROR:', cause);
+        setError(`Album previews could not load: ${errorText(cause)}`);
+      })
+      .finally(() => { if (!stale) setMediaLoading(false); });
+    setSettings(album.settings ?? { photoSelectionLimit: 100, watermarkEnabled: false, watermarkPath: '', downloadEnabled: false, expirationDays: 365 });
+    void (async () => {
+      const result = await call<{ mediaIds: string[] }>('getStudioAlbumSelections', { albumId: album.id });
+      const pages: Row[][] = [];
+      for (let index = 0; index < result.mediaIds.length; index += 60) {
+        const page = await call<{ media: Row[] }>('getStudioAlbumMedia', { albumId: album.id, mediaIds: result.mediaIds.slice(index, index + 60) });
+        pages.push(page.media);
+      }
+      setSelections(pages.flat());
+    })().catch(() => setSelections([]));
+    return () => { stale = true; offAlbum(); };
+  }, [album?.id]);
+
+  useEffect(() => {
+    if (tab !== 'AI Photo Quality' || !album) return;
+    let stale = false;
+    const refresh = () => {
+      setAiSummaryLoading(true);
+      void call<Row>('getStudioAlbumAiSummary', { albumId: album.id })
+        .then((summary) => { if (!stale) setAiSummary(summary); })
+        .catch((cause) => { if (!stale) setError(`AI photo quality summary could not load: ${errorText(cause)}`); })
+        .finally(() => { if (!stale) setAiSummaryLoading(false); });
+    };
+    refresh();
+    const timer = window.setInterval(refresh, 10000);
+    return () => { stale = true; window.clearInterval(timer); };
+  }, [album?.id, tab]);
+
+  const loadMoreMedia = async () => {
+    if (!album || !mediaCursor || mediaLoading) return;
+    setMediaLoading(true);
+    try {
+      const result = await call<{ media: Row[]; nextCursor: string | null }>('getStudioAlbumMedia', { albumId: album.id, cursor: mediaCursor });
+      setMedia((previous) => {
+        const existing = new Set(previous.map((item) => item.id));
+        return [...previous, ...result.media.filter((item) => !existing.has(item.id))];
+      });
+      setMediaCursor(result.nextCursor);
+    } catch (cause) {
+      setError(`More album media could not load: ${errorText(cause)}`);
+    } finally {
+      setMediaLoading(false);
+    }
+  };
+
+  // Load every media page while AI Photo Quality is open so category filters
+  // cover the entire album, not only the first page of results.
+  useEffect(() => {
+    if (tab === 'AI Photo Quality' && album && mediaCursor && !mediaLoading) void loadMoreMedia();
+  }, [tab, album?.id, mediaCursor, mediaLoading]);
+
+  const openMedia = async (item: Row) => {
+    if (!album) return;
+    try {
+      const result = await call<{ media: Row[] }>('getStudioAlbumMedia', { albumId: album.id, mediaIds: [item.id] });
+      if (result.media[0]) setPreview(result.media[0]);
+    } catch (cause) {
+      const message = `Media preview could not load: ${errorText(cause)}`;
+      setError(message);
+      notify(message, 'error');
+    }
+  };
+
+  // Preserve album-wide search while signing image URLs only for pages the
+  // visitor reaches. Searching loads remaining metadata pages as needed.
+  useEffect(() => {
+    if (tab === 'All Media' && search.trim() && mediaCursor && !mediaLoading) void loadMoreMedia();
+  }, [tab, search, mediaCursor, mediaLoading]);
+
+  const usedBytes = albums.reduce((sum, a) => sum + Number(a.storageBytes ?? 0), 0); const allocationGB = Number(subscription?.storagePerMonthGB ?? subscription?.storageLimitGB ?? subscription?.storageGB ?? 0); const usedGB = usedBytes / 1024 ** 3; const storagePercent = allocationGB ? Math.min(100, usedGB / allocationGB * 100) : 0;
+  const expiry = asDate(subscription?.expirationDate ?? subscription?.expiresAt); const days = expiry ? Math.max(0, Math.ceil((expiry.getTime() - Date.now()) / 86400000)) : 0;
+  const albumExpired = album && (album.status === 'expired' || (asDate(album.expirationDate)?.getTime() ?? Infinity) <= Date.now()); const canEdit = !!subscription && !albumExpired;
+  const albumMedia = useMemo(() => media.filter((m) => (!activeFolder || m.folderId === activeFolder.id) && (mediaTypeFilter === 'all' || m.mediaType === mediaTypeFilter) && String(m.filename).toLowerCase().includes(search.toLowerCase())), [media, activeFolder, search, mediaTypeFilter]);
+  const visibleFolders = folders.filter((f) => f.albumId === album?.id && (f.parentId ?? null) === (activeFolder?.id ?? null));
+  const parentFolder = activeFolder?.parentId ? folders.find((folder) => folder.id === activeFolder.parentId && folder.albumId === album?.id) ?? null : null;
+  const refreshFolders = async (albumId: string) => {
+    const result = await call<{ folders: Row[] }>('getStudioAlbumFolders', { albumId });
+    setFolders(result.folders);
+  };
+
+  const purchase = async () => { if (!purchasePlan || busy) return; setBusy(true); setError(''); try { await call('purchaseAlbumPlan', { planId: purchasePlan.id, requestId: crypto.randomUUID().replace(/-/g, '') }); setPurchasePlan(null); notify('Album plan purchased successfully.', 'success'); } catch (e) { setError(errorText(e)); } finally { setBusy(false); } };
+  const testR2 = async () => {
+    if (testingR2) return;
+    setTestingR2(true);
+    try {
+      const result = await call<{ success: boolean; message: string; bucket: string }>('testR2Connection', {});
+      console.log('R2 TEST RESULT:', result);
+      notify(result.message || 'Cloudflare R2 connected successfully.', 'success');
+    } catch (cause) {
+      console.error('R2 TEST FAILED:', cause);
+      setError(`R2 connection failed: ${errorText(cause)}`);
+      notify('R2 connection failed. Check the error details.', 'error');
+    } finally {
+      setTestingR2(false);
+    }
+  };
+  const selectAlbumCover = (file?: File) => {
+    if (!file) return;
+    if (!file.type.startsWith('image/')) { setAlbumCoverFile(null); setAlbumCoverPreview(''); setError('Choose an image file for the album cover.'); notify('Album cover must be an image.', 'error'); return; }
+    if (file.size > 10 * 1024 * 1024) { setAlbumCoverFile(null); setAlbumCoverPreview(''); setError('Album cover image must be 10 MB or smaller.'); notify('Album cover image must be 10 MB or smaller.', 'error'); return; }
+    setError('');
+    setAlbumCoverFile(file);
+    setAlbumCoverPreview(URL.createObjectURL(file));
+  };
+  const createAlbum = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (busy) return;
+    if (!albumCoverFile || !uid) { setError('Choose an album cover image before creating the album.'); notify('Add an album cover image to continue.', 'error'); return; }
+    setBusy(true); setError(''); notify('Creating album and uploading cover…', 'info');
+    let createdAlbumId: string | undefined;
+    let coverReference: ReturnType<typeof ref> | undefined;
+    try {
+      const { albumId } = await call<{ albumId: string }>('createAlbum', { albumName, creationDate });
+      createdAlbumId = albumId;
+      const coverPath = `studioUploads/${uid}/albums/${albumId}/cover/${crypto.randomUUID()}`;
+      coverReference = ref(storage, coverPath);
+      await uploadBytes(coverReference, albumCoverFile, { contentType: albumCoverFile.type });
+      const coverUrl = await getDownloadURL(coverReference);
+      await call('updateAlbum', { albumId, coverImagePath: coverPath, coverImageUrl: coverUrl });
+      setNewAlbum(false); setAlbumName(''); setAlbumCoverFile(null); setAlbumCoverPreview(''); setAlbum(null); history.replaceState(null, '', location.pathname);
+      notify('Album created with its cover image.', 'success');
+    } catch (cause) {
+      if (coverReference) await deleteObject(coverReference).catch(() => undefined);
+      if (createdAlbumId) await call('deleteAlbum', { albumId: createdAlbumId }).catch(() => undefined);
+      const message = errorText(cause); setError(message); notify(`Could not create album: ${message}`, 'error');
+    } finally { setBusy(false); }
+  };
+  const createFolder = async (e: React.FormEvent) => { e.preventDefault(); if (!album || !folderName.trim() || busy) return; setBusy(true); notify('Creating folder…', 'info'); try { await call('createAlbumFolder', { albumId: album.id, parentId: activeFolder?.id ?? null, folderName }); await refreshFolders(album.id); setFolderDialog(false); setFolderName(''); notify('Folder created.', 'success'); } catch (cause) { const message = errorText(cause); setError(message); notify(`Could not create folder: ${message}`, 'error'); } finally { setBusy(false); } };
+  const ensureFolderPath = async (relative: string) => { if (!album) throw new Error('Album is not open.'); const segments = relative.split('/').filter(Boolean).slice(0, -1); let parentId = activeFolder?.id ?? null; let path = activeFolder?.folderPath ?? ''; for (const segment of segments) { path = path ? `${path}/${segment}` : segment; const cacheKey = `${album.id}:${path}`; let folderId = createdFolders.current[cacheKey] ?? folders.find((f) => f.albumId === album.id && f.folderPath === path && (f.parentId ?? null) === parentId)?.id; if (!folderId) { const result = await call<{ folderId: string }>('createAlbumFolder', { albumId: album.id, parentId, folderName: segment }); folderId = result.folderId; createdFolders.current[cacheKey] = folderId; } parentId = folderId; } return parentId ?? activeFolder?.id; };
+  const runUpload = async (files: FileList | File[]) => {
+    if (!album || !activeFolder || !canEdit) return;
+    const list = Array.from(files); const attempted = new Set<string>(); setError('');
+    if (list.length) notify(`Uploading ${list.length} file${list.length === 1 ? '' : 's'}…`, 'info');
+    for (const file of list) {
+      const key = `${file.name}-${file.size}`; let reservation = uploadReservations.current.get(file); setUploading((old) => ({ ...old, [key]: { percent: reservation?.uploaded ? 100 : 0, size: file.size } }));
+      try {
+        const relativePath = (file as File & { webkitRelativePath?: string }).webkitRelativePath;
+        const destinationFolderId = reservation?.folderId ?? (relativePath ? await ensureFolderPath(relativePath) : activeFolder.id);
+        if (!destinationFolderId) throw new Error('Choose or create a folder before uploading.');
+        const duplicateKey = `${destinationFolderId}:${file.name.toLowerCase()}:${file.size}`;
+        if (!reservation && (attempted.has(duplicateKey) || media.some((m) => m.folderId === destinationFolderId && String(m.filename).toLowerCase() === file.name.toLowerCase() && Number(m.originalSizeBytes) === file.size))) throw new Error('A file with the same name and size is already in this folder.');
+        attempted.add(duplicateKey);
+        const mediaType = file.type.startsWith('video/') ? 'video' : 'photo';
+        if (!file.type.startsWith('image/') && mediaType === 'photo') throw new Error('Choose an image or video file.');
+        if (!reservation) {
+          const { mediaId, originalPath, uploadUrl, storageProvider } = await call<{
+            mediaId: string;
+            originalPath: string;
+            uploadUrl?: string;
+            storageProvider: 'firebase' | 'r2';
+          }>('createAlbumUpload', {
+            albumId: album.id,
+            folderId: destinationFolderId,
+            filename: file.name,
+            contentType: file.type,
+            sizeBytes: file.size,
+            mediaType,
+            storageProvider: 'r2',
+          });
+          // Treat the callable result as its data payload (the shared call helper unwraps result.data).
+          // Do not log uploadUrl: it is a short-lived bearer URL that authorizes this upload.
+          console.log('R2 upload reservation:', { mediaId, originalPath, storageProvider, uploadUrlReceived: Boolean(uploadUrl) });
+          reservation = { mediaId, originalPath, uploadUrl, storageProvider, folderId: destinationFolderId, uploaded: false };
+          uploadReservations.current.set(file, reservation);
+          if (storageProvider !== 'r2' || !uploadUrl) {
+            throw new Error(`R2 upload URL missing. Provider: ${storageProvider}`);
+          }
+        }
+        if (!reservation.uploaded) {
+          if (reservation.storageProvider !== 'r2' || !reservation.uploadUrl) throw new Error('Upload URL is missing. Create a new upload reservation.');
+          await uploadToR2(reservation.uploadUrl, file, key, (percent) => {
+            setUploading((old) => ({ ...old, [key]: { percent, size: file.size } }));
+          });
+          reservation = { ...reservation, uploaded: true };
+          uploadReservations.current.set(file, reservation);
+        }
+        const finalizeResult = await call<{ success: boolean; mediaId: string; ready?: boolean; processing?: boolean }>('finalizeAlbumUpload', { albumId: album.id, mediaId: reservation.mediaId });
+        console.log('FINALIZE RESPONSE:', finalizeResult);
+        if (finalizeResult.ready) {
+          try {
+            const { media: finalizedMedia } = await call<{ media: Row[] }>('getStudioAlbumMedia', { albumId: album.id, mediaIds: [reservation.mediaId] });
+            const readyItem = finalizedMedia[0];
+            if (readyItem) setMedia((current) => [readyItem, ...current.filter((item) => item.id !== readyItem.id)]);
+          } catch (mediaError) {
+            console.error('FINALIZED MEDIA PREVIEW LOAD FAILED:', mediaError);
+          }
+        }
+        uploadReservations.current.delete(file);
+        setUploading((old) => { const next = { ...old }; delete next[key]; return next; });
+        setFailedUploads((old) => old.filter((item) => item !== file));
+        notify(`${file.name} uploaded successfully.`, 'success');
+      } catch (cause) {
+        delete uploadRequests.current[key];
+        if (reservation && !reservation.uploaded) {
+          await call('cancelAlbumUpload', { albumId: album.id, mediaId: reservation.mediaId }).catch(() => undefined);
+          uploadReservations.current.delete(file);
+          reservation = undefined;
+        }
+        const uploadError = cause as { code?: string; message?: string; serverResponse?: unknown };
+        console.error('ALBUM UPLOAD FAILED', { code: uploadError?.code, message: uploadError?.message, serverResponse: uploadError?.serverResponse, error: cause });
+        if (reservation) uploadReservations.current.set(file, reservation);
+        setFailedUploads((old) => old.includes(file) ? old : [...old, file]);
+        setError(`${file.name}: ${errorText(cause)}`);
+        notify(`${file.name} upload failed: ${errorText(cause)}`, 'error');
+        setUploading((old) => { const next = { ...old }; delete next[key]; return next; });
+      }
+    }
+    await refreshFolders(album.id).catch((cause) => setError(`Album folders could not refresh: ${errorText(cause)}`));
+  };
+  const uploadWatermark = async (file?: File) => { if (!album || !file || !uid) return; if (!file.type.startsWith('image/')) { setError('Choose a watermark image.'); return; } setBusy(true); try { const path = `studioUploads/${uid}/albums/${album.id}/watermark/${crypto.randomUUID()}`; await uploadBytes(ref(storage, path), file, { contentType: file.type }); setSettings({ ...settings, watermarkPath: path, watermarkEnabled: true }); } catch (cause) { setError(errorText(cause)); } finally { setBusy(false); } };
+  const saveSettings = async () => { if (!album || !settings || busy) return; setBusy(true); notify('Saving album settings…', 'info'); try { await call('updateAlbumSettings', { albumId: album.id, settings }); setAlbum({ ...album, settings, expirationDate: new Date((asDate(album.creationDate)?.getTime() ?? Date.now()) + Number(settings.expirationDays) * 86400000) }); notify('Album settings saved.', 'success'); } catch (cause) { const message = errorText(cause); setError(message); notify(`Could not save settings: ${message}`, 'error'); } finally { setBusy(false); } };
+  const downloadOriginal = async (item: Row) => { notify(`Preparing ${item.filename}…`, 'info'); try { const { url } = await call<{ url: string }>('getStudioOriginalDownload', { albumId: album?.id, mediaId: item.id }); const link = document.createElement('a'); link.href = url; link.download = item.filename; link.click(); notify(`Download started: ${item.filename}`, 'success'); } catch (cause) { const message = errorText(cause); setError(message); notify(`Download failed: ${message}`, 'error'); } };
+  const downloadSelected = async () => { if (!album || busy) return; setBusy(true); setError(''); notify('Preparing selected photos…', 'info'); try { const result = await call<{ url: string }>('createSelectedPhotosArchive', { albumId: album.id }); const link = document.createElement('a'); link.href = result.url; link.download = `${album.albumName}-selected-originals.zip`; link.click(); notify('Selected photos download started.', 'success'); } catch (cause) { const message = errorText(cause); setError(message); notify(`Could not download selected photos: ${message}`, 'error'); } finally { setBusy(false); } };
+  const deleteAlbum = async (item: Row) => { if (!confirm(`Delete “${item.albumName}” and all its album data?`)) return; setBusy(true); try { await call('deleteAlbum', { albumId: item.id }); } catch (cause) { setError(errorText(cause)); } finally { setBusy(false); } };
+  const deleteMediaItems = async (items: Row[]) => {
+    if (!album || !items.length) return;
+    const uniqueItems = [...new Map(items.map((item) => [item.id, item])).values()];
+    const deletingIds = new Set(uniqueItems.map((item) => item.id));
+    setDeletingMediaIds((current) => new Set([...current, ...deletingIds]));
+    setError('');
+    const removed = new Set<string>();
+    const failures: string[] = [];
+    try {
+      // Send the single-item request shape supported by both the deployed
+      // callable and newer batch-capable versions. Limit parallel deletes to
+      // reduce counter transaction contention while handling large selections.
+      for (let index = 0; index < uniqueItems.length; index += 5) {
+        const batch = uniqueItems.slice(index, index + 5);
+        const results = await Promise.allSettled(batch.map(async (item) => ({
+          item,
+          result: await call<{ success?: boolean; results?: { success: boolean; mediaId: string; error?: string }[] }>('deleteAlbumMedia', { albumId: album.id, mediaId: item.id }),
+        })));
+        results.forEach((settled, itemIndex) => {
+          const item = batch[itemIndex];
+          if (settled.status === 'rejected') {
+            failures.push(`${item.filename}: ${errorText(settled.reason)}`);
+            return;
+          }
+          const response = settled.value.result;
+          const outcome = response.results?.find((entry) => entry.mediaId === item.id);
+          if (outcome?.success || response.success) removed.add(item.id);
+          else failures.push(`${item.filename}: ${outcome?.error ?? 'Deletion failed.'}`);
+        });
+      }
+      if (removed.size) {
+        const removedItems = uniqueItems.filter((item) => removed.has(item.id));
+        setMedia((current) => current.filter((item) => !removed.has(item.id)));
+        setSelections((current) => current.filter((item) => !removed.has(item.id)));
+        setSelectedMediaIds((current) => new Set([...current].filter((id) => !removed.has(id))));
+        const photos = removedItems.filter((item) => item.mediaType === 'photo').length;
+        const videos = removedItems.filter((item) => item.mediaType === 'video').length;
+        setAlbum((current) => current?.id === album.id ? { ...current, photoCount: Math.max(0, Number(current.photoCount ?? 0) - photos), videoCount: Math.max(0, Number(current.videoCount ?? 0) - videos), storageBytes: Math.max(0, Number(current.storageBytes ?? 0) - removedItems.reduce((sum, item) => sum + Number(item.storedSizeBytes ?? item.originalSizeBytes ?? 0), 0)) } : current);
+        setAlbums((current) => current.map((item) => item.id === album.id ? { ...item, photoCount: Math.max(0, Number(item.photoCount ?? 0) - photos), videoCount: Math.max(0, Number(item.videoCount ?? 0) - videos) } : item));
+        notify(`${removed.size} media item${removed.size === 1 ? '' : 's'} deleted.`, 'success');
+      }
+      if (failures.length) {
+        const message = failures.slice(0, 3).join(' · ');
+        setError(`${failures.length} item${failures.length === 1 ? '' : 's'} could not be deleted: ${message}`);
+        notify(`${failures.length} media item${failures.length === 1 ? '' : 's'} could not be deleted.`, 'error');
+      }
+    } finally {
+      setDeletingMediaIds((current) => new Set([...current].filter((id) => !deletingIds.has(id))));
+    }
+  };
+  const deleteMedia = (item: Row) => {
+    if (deletingMediaIds.has(item.id)) return;
+    if (confirm(`Delete “${item.filename}”? This permanently removes the original and generated previews.`)) void deleteMediaItems([item]);
+  };
+  const deleteSelectedMedia = () => {
+    const selected = media.filter((item) => selectedMediaIds.has(item.id));
+    if (!selected.length) return;
+    if (confirm(`Delete ${selected.length} selected media item${selected.length === 1 ? '' : 's'}? This permanently removes their originals and generated previews.`)) void deleteMediaItems(selected);
+  };
+  const toggleMediaSelection = (id: string) => setSelectedMediaIds((current) => {
+    const next = new Set(current);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  });
+  const toggleSelectAllVisible = () => setSelectedMediaIds((current) => {
+    const next = new Set(current);
+    const allVisibleSelected = albumMedia.length > 0 && albumMedia.every((item) => next.has(item.id));
+    albumMedia.forEach((item) => allVisibleSelected ? next.delete(item.id) : next.add(item.id));
+    return next;
+  });
+  const setCover = async (item: Row) => { if (!album) return; notify('Updating album cover…', 'info'); try { await call('updateAlbum', { albumId: album.id, coverMediaId: item.id }); const updated = { ...album, coverMediaId: item.id, coverUrl: item.thumbnailUrl ?? item.previewUrl }; setAlbum(updated); setAlbums((old) => old.map((a) => a.id === album.id ? updated : a)); notify('Album cover updated.', 'success'); } catch (cause) { const message = errorText(cause); setError(message); notify(`Could not update cover: ${message}`, 'error'); } };
+
+  if (loading) return <div className="grid min-h-64 place-items-center text-sm text-slate-500"><LoaderCircle className="mr-2 h-5 w-5 animate-spin" />Loading Album Selection…</div>;
+  if (!subscription && !hasExpired) return <div className="space-y-6 pb-10"><header><p className="text-xs font-bold uppercase tracking-wider text-[#E50914]">ON AIR Studio</p><h1 className="mt-1 text-2xl font-black text-slate-900">Album Selection</h1><p className="mt-1 text-sm text-slate-600">Choose a monthly plan to create and share albums independently from your events.</p></header>{error && <p role="alert" className="rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-700">{error}</p>}{hasExpired && <div className="rounded-2xl border border-red-200 bg-red-50 p-5"><b className="text-red-800">Your album plan has expired.</b><p className="mt-1 text-sm text-red-700">Existing albums, media and selections are preserved. Renew to continue managing them.</p></div>}<div className="rounded-xl border border-slate-200 bg-white p-4 text-sm">Wallet balance <b className="ml-2">₹{walletBalance.toLocaleString('en-IN')}</b></div><div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">{plans.map((p) => <article key={p.id} className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm"><div className="flex h-11 w-11 items-center justify-center rounded-xl bg-red-50 text-[#E50914]"><Album /></div><h2 className="mt-4 text-lg font-bold">{p.planName}</h2><p className="mt-3 text-3xl font-black">₹{Number(p.pricePerMonth).toLocaleString('en-IN')}<small className="ml-1 text-sm font-medium text-slate-500">/month</small></p><p className="mt-2 text-sm text-slate-600">{p.storagePerMonthGB} GB storage per month</p><button onClick={() => setPurchasePlan(p)} className="mt-5 w-full rounded-xl bg-[#E50914] px-4 py-3 text-sm font-bold text-white">Purchase Plan</button></article>)}</div>{plans.length === 0 && <p className="rounded-xl border border-dashed p-8 text-center text-sm text-slate-500">No active album plans are available.</p>}{purchasePlan && <div className="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4"><form onSubmit={(e) => { e.preventDefault(); void purchase(); }} className="w-full max-w-md rounded-2xl bg-white p-6"><h2 className="text-lg font-bold">Confirm plan purchase</h2><p className="mt-3 text-sm">{purchasePlan.planName} · ₹{purchasePlan.pricePerMonth}/month</p><p className="mt-1 text-sm text-slate-600">Wallet balance: ₹{walletBalance.toLocaleString('en-IN')}</p>{walletBalance < purchasePlan.pricePerMonth && <p className="mt-2 text-sm text-red-700">Insufficient wallet balance.</p>}<div className="mt-5 flex gap-2"><button disabled={busy || walletBalance < purchasePlan.pricePerMonth} className="flex-1 rounded-xl bg-[#E50914] p-3 font-bold text-white disabled:opacity-50">{busy ? 'Processing…' : 'Confirm & Pay'}</button><button type="button" onClick={() => setPurchasePlan(null)} className="rounded-xl border px-4">Cancel</button></div></form></div>}</div>;
+
+  if (!subscription && hasExpired && !album) return <div className="space-y-6 pb-10"><header className="rounded-2xl border border-red-200 bg-red-50 p-5"><h1 className="text-xl font-black text-red-900">Album plan expired</h1><p className="mt-1 text-sm text-red-800">Albums, original files and guest selections are preserved. Renew your plan to create albums or upload media.</p></header><h2 className="text-lg font-bold">Renew Plan</h2><div className="grid gap-4 md:grid-cols-3">{plans.map((p) => <article key={p.id} className="rounded-xl border bg-white p-5"><b>{p.planName}</b><p className="mt-2">₹{p.pricePerMonth}/month · {p.storagePerMonthGB} GB</p><button onClick={() => setPurchasePlan(p)} className="mt-4 rounded-lg bg-[#E50914] px-4 py-2 font-bold text-white">Purchase Plan</button></article>)}</div><h2 className="text-lg font-bold">Your Albums</h2><div className="grid gap-3 md:grid-cols-3">{albums.map((item) => <article key={item.id} className="rounded-xl border bg-white p-4"><b>{item.albumName}</b><p className="mt-1 text-xs text-slate-500">{item.photoCount ?? 0} photos · {item.videoCount ?? 0} videos · {item.status}</p><button onClick={() => void openAlbum(item)} className="mt-3 rounded-lg border px-3 py-2 text-sm font-bold">View preserved album</button></article>)}</div>{purchasePlan && <div className="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4"><section className="w-full max-w-sm rounded-2xl bg-white p-5"><b>Renew {purchasePlan.planName}?</b><p className="mt-2 text-sm">₹{purchasePlan.pricePerMonth} will be charged to your wallet.</p><div className="mt-4 flex gap-2"><button onClick={() => void purchase()} disabled={busy || walletBalance < purchasePlan.pricePerMonth} className="flex-1 rounded-lg bg-[#E50914] p-2 font-bold text-white disabled:opacity-50">{busy ? 'Processing…' : 'Confirm & Pay'}</button><button onClick={() => setPurchasePlan(null)} className="rounded-lg border px-3">Cancel</button></div></section></div>}</div>;
+  if (!album) return <div className="space-y-6 pb-10"><div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-end"><div><p className="text-xs font-bold uppercase tracking-wider text-[#E50914]">ON AIR Studio / Album Selection</p><h1 className="mt-1 text-2xl font-black text-slate-900">Album Selection</h1><p className="mt-1 text-sm text-slate-600">Create and manage albums independently from Events.</p></div><div className="flex flex-wrap items-center gap-3"><button type="button" onClick={() => void testR2()} disabled={testingR2} className="inline-flex items-center justify-center gap-2 rounded-xl border border-[#E50914] px-4 py-3 text-sm font-semibold text-[#E50914] hover:bg-red-50 disabled:opacity-60"><Cloud className="h-4 w-4" />{testingR2 ? 'Testing R2…' : 'Test Cloudflare R2'}</button><button onClick={() => setNewAlbum(true)} className="inline-flex items-center justify-center gap-2 rounded-xl bg-[#E50914] px-4 py-3 text-sm font-bold text-white"><Plus className="h-4 w-4" />Create Album</button></div></div>
+    <section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"><div className="flex flex-col justify-between gap-4 md:flex-row"><div><span className="rounded-full bg-emerald-50 px-3 py-1 text-xs font-bold text-emerald-700">Active Plan</span><h2 className="mt-3 text-xl font-black">{subscription.planNameSnapshot ?? subscription.planName ?? 'Album Plan'}</h2><p className="mt-1 text-sm text-slate-600">₹{subscription.pricePerMonth ?? subscription.priceSnapshot ?? subscription.monthlyPrice ?? 0} / month · {allocationGB} GB storage</p></div><div className="grid flex-1 gap-3 sm:grid-cols-3"><p className="text-sm"><b>Purchased</b><br />{dateText(subscription.purchaseDate)}</p><p className="text-sm"><b>Expires</b><br />{dateText(expiry)}</p><p className="text-sm"><b>Days remaining</b><br />{days}</p><p className="text-sm"><b>Storage used</b><br />{usedGB.toFixed(2)} GB</p><p className="text-sm"><b>Remaining</b><br />{Math.max(0, allocationGB - usedGB).toFixed(2)} GB</p><button onClick={() => setPurchasePlan(plans[0] ?? null)} className="h-fit rounded-lg border border-[#E50914] px-3 py-2 text-xs font-bold text-[#E50914]">Renew / Upgrade</button><div className="col-span-full"><div className="h-2.5 overflow-hidden rounded-full bg-slate-100"><div className="h-full bg-[#E50914]" style={{ width: `${storagePercent}%` }} /></div></div></div></div></section>
+    {error && <p role="alert" className="rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-700">{error}</p>}
+    <div className="flex flex-wrap items-center gap-2"><label className="flex flex-1 items-center gap-2 rounded-xl border bg-white px-3"><Search className="h-4 w-4 text-slate-400" /><input value={albumSearch} onChange={(e) => setAlbumSearch(e.target.value)} placeholder="Search albums" className="w-full py-2.5 text-sm outline-none" /></label><button onClick={() => setAlbumListView(!albumListView)} className="rounded-xl border bg-white p-2.5">{albumListView ? <Grid2X2 /> : <List />}</button></div>{albums.length ? <div className={albumListView ? "space-y-3" : "grid gap-4 md:grid-cols-2 xl:grid-cols-3"}>{albums.filter((a) => String(a.albumName).toLowerCase().includes(albumSearch.toLowerCase())).map((item) => <article key={item.id} className="overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm"><div className="relative grid h-40 place-items-center bg-gradient-to-br from-rose-50 to-slate-100 text-[#E50914]">{(item.coverUrl ?? item.coverImageUrl) ? <OptimizedAlbumImage src={item.coverUrl ?? item.coverImageUrl} alt={item.albumName} width={800} height={450} className="h-full w-full" /> : <Album className="h-12 w-12" />}<span className={`absolute right-3 top-3 rounded-full px-2.5 py-1 text-xs font-bold ${item.status === 'active' ? 'bg-emerald-50 text-emerald-700' : 'bg-slate-100 text-slate-600'}`}>{item.status ?? 'draft'}</span></div><div className="p-4"><div className="flex items-start justify-between"><div><h2 className="font-bold text-slate-900">{item.albumName}</h2><p className="mt-1 text-xs text-slate-500">{item.photoCount ?? 0} photos · {item.videoCount ?? 0} videos</p><p className="mt-1 text-xs text-slate-500">Created {dateText(item.creationDate)} · Expires {dateText(item.expirationDate)}</p></div><details className="relative"><summary className="list-none rounded-lg p-2 text-slate-500 hover:bg-slate-100"><MoreVertical className="h-4 w-4" /></summary><div className="absolute right-0 top-9 z-10 w-44 rounded-xl border bg-white p-1 shadow-lg"><button onClick={() => { const next = prompt("Album name", item.albumName); if (next?.trim()) void call("updateAlbum", { albumId: item.id, albumName: next.trim() }); }} className="block w-full rounded-lg px-3 py-2 text-left text-xs hover:bg-slate-50">Edit Album Name</button><button onClick={() => void call("updateAlbum", { albumId: item.id, status: item.status === "archived" ? "draft" : "archived" }).catch((e) => setError(errorText(e)))} className="block w-full rounded-lg px-3 py-2 text-left text-xs hover:bg-slate-50">{item.status === "archived" ? "Unarchive Album" : "Archive Album"}</button><button onClick={() => void call<{url:string}>("generateAlbumShareLink", { albumId: item.id }).then((r) => (() => { const albumViewUrl = getAlbumViewUrl(r.url); localStorage.setItem("onair_album_share_url_" + item.id, albumViewUrl); return navigator.clipboard.writeText(albumViewUrl); })().then(() => notify("Album link copied.", "success"))).catch((e) => setError(errorText(e)))} className="block w-full rounded-lg px-3 py-2 text-left text-xs hover:bg-slate-50">Copy Album Link</button><button onClick={() => void deleteAlbum(item)} className="block w-full rounded-lg px-3 py-2 text-left text-xs text-red-600 hover:bg-red-50">Delete Album</button></div></details></div><div className="mt-4 flex gap-2"><button onClick={() => void openAlbum(item)} className="flex-1 rounded-lg bg-[#E50914] px-3 py-2.5 text-sm font-bold text-white">Open Album</button><button onClick={() => window.open(`${location.origin}/?album=${encodeURIComponent(item.id)}`, '_blank', 'noopener')} title="Open in new page" className="rounded-lg border px-3 text-slate-600"><ExternalLink className="h-4 w-4" /></button></div></div></article>)}</div> : <div className="rounded-2xl border border-dashed border-slate-300 bg-white p-10 text-center"><Album className="mx-auto h-10 w-10 text-slate-300" /><h2 className="mt-3 font-bold">No albums yet</h2><p className="mt-1 text-sm text-slate-500">Create your first independent album.</p><button onClick={() => setNewAlbum(true)} className="mt-4 rounded-xl bg-[#E50914] px-4 py-2.5 text-sm font-bold text-white">Create Album</button></div>}
+    {newAlbum && <div className="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4"><form onSubmit={(e) => void createAlbum(e)} className="w-full max-w-md rounded-2xl bg-white p-6"><div className="flex items-center justify-between"><h2 className="text-lg font-bold">Create Album</h2><button type="button" onClick={() => { setNewAlbum(false); setAlbumCoverFile(null); setAlbumCoverPreview(''); }}><X className="h-5 w-5" /></button></div><label className="mt-5 block text-sm font-semibold">Album Name<input required maxLength={120} value={albumName} onChange={(e) => setAlbumName(e.target.value)} className="mt-1 w-full rounded-xl border px-3 py-2.5" /></label><label className="mt-4 block text-sm font-semibold">Album Cover Image<input required type="file" accept="image/*" onChange={(e) => selectAlbumCover(e.target.files?.[0])} className="mt-1 block w-full rounded-xl border px-3 py-2 text-sm file:mr-3 file:rounded-lg file:border-0 file:bg-rose-50 file:px-3 file:py-2 file:font-semibold file:text-[#E50914]" /><span className="mt-1 block text-xs font-normal text-slate-500">Choose one image, up to 10 MB. This is the album cover, not album media.</span>{albumCoverPreview && <img src={albumCoverPreview} alt="Selected album cover preview" className="mt-3 h-36 w-full rounded-xl border object-cover" />}</label><label className="mt-4 block text-sm font-semibold">Album Creation Date<input required type="date" value={creationDate} onChange={(e) => setCreationDate(e.target.value)} className="mt-1 w-full rounded-xl border px-3 py-2.5" /></label><div className="mt-5 flex gap-2"><button disabled={busy || !albumCoverFile} className="flex-1 rounded-xl bg-[#E50914] p-3 font-bold text-white disabled:opacity-50">{busy ? 'Creating Album…' : 'Create Album'}</button><button type="button" onClick={() => { setNewAlbum(false); setAlbumCoverFile(null); setAlbumCoverPreview(''); }} className="rounded-xl border px-4">Cancel</button></div></form></div>}</div>;
+
+  return <div className="space-y-4 pb-10"><nav className="flex items-center gap-2 text-sm"><button onClick={() => { setAlbum(null); setActiveFolder(null); history.replaceState(null, '', location.pathname); }} className="font-semibold text-[#E50914]">Album Selection</button><ChevronRight className="h-4 w-4 text-slate-400" /><span className="font-semibold">{album.albumName}</span>{activeFolder && <><ChevronRight className="h-4 w-4 text-slate-400" /><span>{activeFolder.folderName}</span></>}</nav><section className="rounded-2xl border border-slate-200 bg-white p-5"><div className="flex flex-wrap items-center gap-4"><div className="grid h-16 w-16 place-items-center overflow-hidden rounded-xl bg-rose-50 text-[#E50914]">{(album.coverUrl ?? album.coverImageUrl) ? <OptimizedAlbumImage src={album.coverUrl ?? album.coverImageUrl} alt={album.albumName} width={800} height={450} className="h-full w-full" /> : <Album className="h-8 w-8" />}</div><div className="min-w-0 flex-1"><div className="flex items-center gap-2"><h1 className="truncate text-xl font-black">{album.albumName}</h1><span className="rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-bold text-emerald-700">{albumExpired ? 'Expired' : album.status ?? 'Draft'}</span></div><p className="mt-1 text-xs text-slate-500">{(album.photoCount ?? media.filter((m) => m.mediaType === 'photo').length)} photos · {(album.videoCount ?? media.filter((m) => m.mediaType === 'video').length)} videos · Created {dateText(album.creationDate)} · Expires {dateText(album.expirationDate)}</p></div><button onClick={() => { setTab('Share Album'); setActiveFolder(null); }} className="rounded-lg border px-3 py-2 text-sm font-semibold">View Album Link</button><button onClick={() => { const name = prompt('Album name', album.albumName); if (name?.trim()) void call('updateAlbum', { albumId: album.id, albumName: name.trim() }).then(() => setAlbum({ ...album, albumName: name.trim() })).catch((e) => setError(errorText(e))); }} className="rounded-lg p-2 text-slate-500"><MoreVertical className="h-5 w-5" /></button></div></section>
+  {!canEdit && <p className="rounded-xl border border-red-200 bg-red-50 p-3 text-sm text-red-700">Album access has expired. Media and selections are preserved; renew your plan to manage albums.</p>}
+  <div className="flex gap-1 overflow-x-auto border-b" role="tablist" aria-label="Album sections">{tabs.map((item) => <button type="button" role="tab" aria-selected={tab === item} key={item} onClick={() => { if (tab === item) return; setTab(item); setActiveFolder(null); notify(`${item} tab opened.`, 'info'); }} className={`shrink-0 border-b-2 px-4 py-3 text-sm font-bold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[#E50914] ${tab === item ? 'border-[#E50914] text-[#E50914]' : 'border-transparent text-slate-500 hover:text-slate-900'}`}>{item}</button>)}</div>
+  {tab === 'Folders' && activeFolder && <button type="button" onClick={() => setActiveFolder(parentFolder)} className="inline-flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700 hover:bg-slate-50">← Back to {parentFolder?.folderName ?? 'album folders'}</button>}
+  {tab === 'Folders' && <section><div className="mb-4 flex justify-between"><div><h2 className="text-lg font-bold">{activeFolder ? 'Folder Media' : 'Folders'}</h2><p className="text-sm text-slate-500">{activeFolder ? activeFolder.folderName : 'Organize this album into folders.'}</p></div><div className="flex gap-2">{activeFolder && <><button onClick={() => fileInput.current?.click()} disabled={!canEdit} className="rounded-lg bg-[#E50914] px-3 py-2 text-sm font-bold text-white"><Upload className="mr-1 inline h-4 w-4" />Upload Files</button><button onClick={() => folderInput.current?.click()} disabled={!canEdit} className="rounded-lg border px-3 py-2 text-sm font-bold">Upload Folder</button></>}{!activeFolder && <button onClick={() => setFolderDialog(true)} disabled={!canEdit} className="rounded-lg bg-[#E50914] px-3 py-2 text-sm font-bold text-white"><Plus className="mr-1 inline h-4 w-4" />Create Folder</button>}<input ref={fileInput} hidden type="file" multiple accept="image/*,video/*" onChange={(e) => e.target.files && void runUpload(e.target.files)} /><input ref={folderInput} hidden type="file" multiple {...{ webkitdirectory: '', directory: '' } as any} onChange={(e) => e.target.files && void runUpload(e.target.files)} /></div></div>{!activeFolder ? <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">{visibleFolders.map((f) => <article key={f.id} className="flex items-center gap-3 rounded-xl border bg-white p-4"><Folder className="h-9 w-9 text-[#E50914]" /><button onClick={() => setActiveFolder(f)} className="min-w-0 flex-1 text-left"><b className="block truncate">{f.folderName}</b><small className="text-slate-500">{media.filter((m) => m.folderId === f.id).length} files</small></button><button onClick={() => { const name = prompt('Folder name', f.folderName); if (name?.trim()) void call('renameAlbumFolder', { albumId: album.id, folderId: f.id, folderName: name.trim() }).then(() => refreshFolders(album.id)).catch((e) => setError(errorText(e))); }}><MoreVertical className="h-4 w-4" /></button><button onClick={() => { if (confirm(`Delete folder “${f.folderName}”?`)) void call('deleteAlbumFolder', { albumId: album.id, folderId: f.id }).then(() => refreshFolders(album.id)).catch((e) => setError(errorText(e))); }}><Trash2 className="h-4 w-4 text-red-500" /></button></article>)}</div> : <div onDragOver={(e) => e.preventDefault()} onDrop={(e) => { e.preventDefault(); void runUpload(e.dataTransfer.files); }} className="min-h-48 rounded-2xl border-2 border-dashed border-slate-300 bg-white p-5"><div className="mb-4 flex items-center justify-between"><div><p className="text-sm font-semibold text-slate-700">Drop photos or videos here to upload</p><p className="mt-0.5 text-xs text-slate-400">Files will be added to {activeFolder.folderName}</p></div><button onClick={() => setListView(!listView)} aria-label={listView ? 'Switch to grid view' : 'Switch to list view'} className="rounded-lg border p-2">{listView ? <Grid2X2 className="h-4 w-4" /> : <List className="h-4 w-4" />}</button></div><div className="mb-4 grid gap-2 sm:grid-cols-2">{visibleFolders.map((f) => <button key={f.id} onClick={() => setActiveFolder(f)} className="flex items-center gap-2 rounded-lg border bg-white p-3 text-left text-sm"><Folder className="h-4 w-4 text-[#E50914]" />{f.folderName}</button>)}</div><div className="mb-4 space-y-2">{Object.entries(uploading).map(([name, progress]) => <div key={name} className="rounded-xl border border-slate-200 bg-slate-50 p-3"><div className="flex items-start justify-between gap-3"><div className="min-w-0"><p className="truncate text-xs font-semibold text-slate-800" title={name}>{name}</p><p className="mt-1 text-[11px] text-slate-500">{bytesText(progress.size)} <span className="mx-1">·</span> {progress.percent < 100 ? `Uploading ${progress.percent}%` : 'Finalizing upload…'}</p></div><button type="button" onClick={() => uploadRequests.current[name]?.abort()} disabled={!uploadRequests.current[name]} aria-label={`Cancel upload of ${name}`} className="shrink-0 rounded-md border border-slate-200 bg-white px-2.5 py-1 text-xs font-semibold text-slate-600 hover:bg-slate-100 disabled:opacity-40">Cancel</button></div><div className="mt-2 h-2 overflow-hidden rounded-full bg-slate-200" role="progressbar" aria-label={`Upload progress for ${name}`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={progress.percent}><div className="h-full rounded-full bg-[#E50914] transition-[width] duration-300" style={{ width: `${progress.percent}%` }} /></div></div>)}</div>{failedUploads.map((file) => <div key={`${file.name}-${file.size}`} className="mb-2 flex items-center justify-between gap-3 rounded-xl border border-red-200 bg-red-50 p-3 text-xs text-red-700"><span className="min-w-0 truncate">{file.name} · {bytesText(file.size)} · Failed</span><button type="button" onClick={() => void runUpload([file])} className="shrink-0 rounded-md border border-red-200 bg-white px-2.5 py-1 font-semibold hover:bg-red-100">Retry upload</button></div>)}<MediaGrid items={albumMedia} listView={listView} mediaCursor={mediaCursor} mediaLoading={mediaLoading} selectedMediaIds={selectedMediaIds} deletingMediaIds={deletingMediaIds} onToggleSelection={toggleMediaSelection} onSelectAll={toggleSelectAllVisible} onDeleteSelected={deleteSelectedMedia} onLoadMore={loadMoreMedia} onOpen={openMedia} onDownload={downloadOriginal} onSetCover={setCover} onDelete={deleteMedia} /></div>}</section>}
+  {tab === 'All Media' && <section><div className="mb-4 flex flex-wrap gap-2"><label className="flex flex-1 items-center gap-2 rounded-xl border bg-white px-3"><Search className="h-4 w-4 text-slate-400" /><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search media" className="w-full py-2.5 text-sm outline-none" /></label><select value={mediaTypeFilter} onChange={(e) => setMediaTypeFilter(e.target.value)} className="rounded-xl border bg-white px-3"><option value="all">Photos and videos</option><option value="photo">Photos</option><option value="video">Videos</option></select><select value={activeFolder?.id ?? 'all'} onChange={(e) => setActiveFolder(folders.find((f) => f.id === e.target.value) ?? null)} className="rounded-xl border bg-white px-3"><option value="all">All folders</option>{folders.map((f) => <option key={f.id} value={f.id}>{f.folderName}</option>)}</select><button onClick={() => setListView(!listView)} className="rounded-xl border bg-white p-2.5">{listView ? <Grid2X2 /> : <List />}</button></div><MediaGrid items={albumMedia} listView={listView} mediaCursor={mediaCursor} mediaLoading={mediaLoading} selectedMediaIds={selectedMediaIds} deletingMediaIds={deletingMediaIds} onToggleSelection={toggleMediaSelection} onSelectAll={toggleSelectAllVisible} onDeleteSelected={deleteSelectedMedia} onLoadMore={loadMoreMedia} onOpen={openMedia} onDownload={downloadOriginal} onSetCover={setCover} onDelete={deleteMedia} /></section>}
+  {tab === 'AI Photo Quality' && (() => {
+    const photoItems = media.filter((item) => item.mediaType === 'photo' && item.status === 'ready');
+    const matchesFilter = (item: Row) => {
+      const scanStatus = item.aiAnalysis?.status ?? 'unscanned';
+      if (aiFilter === 'all') return true;
+      if (aiFilter === 'pending') return scanStatus === 'pending' || scanStatus === 'unscanned';
+      if (aiFilter === 'processing') return scanStatus === 'processing';
+      if (aiFilter === 'failed') return scanStatus === 'failed';
+      return scanStatus === 'completed' && item.aiAnalysis?.category === aiFilter;
+    };
+    const filteredPhotos = photoItems.filter((item) => matchesFilter(item) && String(item.filename ?? '').toLowerCase().includes(aiSearch.trim().toLowerCase())).sort((a, b) => {
+      if (aiSort === 'name') return String(a.filename ?? '').localeCompare(String(b.filename ?? ''));
+      if (aiSort === 'quality') return String(a.aiAnalysis?.category ?? 'zzz').localeCompare(String(b.aiAnalysis?.category ?? 'zzz'));
+      const at = asDate(a.createdAt ?? a.uploadedAt)?.getTime() ?? 0;
+      const bt = asDate(b.createdAt ?? b.uploadedAt)?.getTime() ?? 0;
+      return aiSort === 'oldest' ? at - bt : bt - at;
+    });
+    const stats = [
+      { label: 'All photos', key: 'all', count: aiSummary?.total ?? photoItems.length, icon: <FileImage className="h-5 w-5" />, tone: 'slate' },
+      { label: 'Waiting', key: 'pending', count: aiSummary?.pending ?? aiSummary?.unscanned ?? 0, icon: <Clock3 className="h-5 w-5" />, tone: 'amber' },
+      { label: 'Scanning', key: 'processing', count: aiSummary?.processing ?? 0, icon: <ScanLine className="h-5 w-5" />, tone: 'blue' },
+      { label: 'Good', key: 'good', count: aiSummary?.good ?? 0, icon: <CheckCircle2 className="h-5 w-5" />, tone: 'green' },
+      { label: 'Blurred', key: 'blurred', count: aiSummary?.blurred ?? 0, icon: <AlertTriangle className="h-5 w-5" />, tone: 'red' },
+      { label: 'Review', key: 'review', count: aiSummary?.review ?? 0, icon: <Search className="h-5 w-5" />, tone: 'violet' },
+      { label: 'Unclear', key: 'unclear', count: aiSummary?.unclear ?? 0, icon: <AlertTriangle className="h-5 w-5" />, tone: 'orange' },
+      { label: 'Failed', key: 'failed', count: aiSummary?.failed ?? 0, icon: <X className="h-5 w-5" />, tone: 'gray' },
+    ];
+    const tones: Record<string, string> = { slate: 'bg-slate-100 text-slate-600', amber: 'bg-amber-50 text-amber-700', blue: 'bg-blue-50 text-blue-700', green: 'bg-emerald-50 text-emerald-700', red: 'bg-red-50 text-red-700', violet: 'bg-violet-50 text-violet-700', orange: 'bg-orange-50 text-orange-700', gray: 'bg-slate-100 text-slate-600' };
+    const selected: Record<string, string> = { all: 'border-slate-800 ring-2 ring-slate-200', pending: 'border-amber-400 ring-2 ring-amber-100', processing: 'border-blue-400 ring-2 ring-blue-100', good: 'border-emerald-400 ring-2 ring-emerald-100', blurred: 'border-red-400 ring-2 ring-red-100', review: 'border-violet-400 ring-2 ring-violet-100', unclear: 'border-orange-400 ring-2 ring-orange-100', failed: 'border-slate-400 ring-2 ring-slate-200' };
+    const badgeFor = (item: Row) => {
+      const status = item.aiAnalysis?.status ?? 'unscanned';
+      if (status !== 'completed') return status === 'processing' ? tones.blue : status === 'failed' ? tones.red : tones.amber;
+      return item.aiAnalysis?.category === 'good' ? tones.green : item.aiAnalysis?.category === 'blurred' ? tones.red : item.aiAnalysis?.category === 'review' ? tones.violet : tones.orange;
+    };
+    const labelFor = (item: Row) => item.aiAnalysis?.status === 'completed' ? String(item.aiAnalysis?.category ?? 'review').replace('_', ' ') : item.aiAnalysis?.status ?? 'not scanned';
+    return <section className="space-y-5">
+      <div className="flex flex-col justify-between gap-3 rounded-2xl border border-slate-200 bg-gradient-to-r from-white to-rose-50/70 p-5 sm:flex-row sm:items-center">
+        <div className="flex items-center gap-3"><span className="grid h-11 w-11 place-items-center rounded-xl bg-rose-100 text-[#E50914]"><ScanLine className="h-5 w-5" /></span><div><h2 className="text-xl font-black text-slate-900">AI Photo Quality</h2><p className="mt-1 text-sm text-slate-500">Review sharpness and exposure across your album.</p></div></div>
+        <div className="flex items-center gap-2 text-xs text-slate-500"><span className={`h-2 w-2 rounded-full ${aiSummaryLoading ? 'animate-pulse bg-amber-500' : 'bg-emerald-500'}`} />{aiSummaryLoading ? 'Refreshing…' : 'Auto-updates every 10 seconds'}<button type="button" title="Refresh summary" onClick={() => void call<Row>('getStudioAlbumAiSummary', { albumId: album.id }).then(setAiSummary).catch((cause) => setError(errorText(cause)))} className="rounded-lg border bg-white p-2 hover:bg-slate-50"><RefreshCw className="h-4 w-4" /></button></div>
+      </div>
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 xl:grid-cols-8">{stats.map((stat) => <button type="button" key={stat.key} onClick={() => setAiFilter(stat.key)} aria-pressed={aiFilter === stat.key} className={`rounded-xl border bg-white p-3 text-left shadow-sm transition hover:-translate-y-0.5 hover:shadow-md ${aiFilter === stat.key ? selected[stat.key] : 'border-slate-200 hover:border-slate-300'}`}><div className="flex items-center justify-between gap-2"><span className="text-xs font-semibold text-slate-500">{stat.label}</span><span className={`grid h-8 w-8 place-items-center rounded-lg ${tones[stat.tone]}`}>{stat.icon}</span></div><p className="mt-2 text-2xl font-black text-slate-900">{stat.count}</p><p className={`mt-1 text-[11px] font-semibold ${aiFilter === stat.key ? 'text-[#E50914]' : 'text-slate-400'}`}>{aiFilter === stat.key ? 'Selected filter' : 'Click to filter'}</p></button>)}</div>
+      <div className="rounded-2xl border border-slate-200 bg-white p-3 shadow-sm sm:p-4"><div className="flex flex-col gap-3 lg:flex-row"><label className="flex min-w-0 flex-1 items-center gap-2 rounded-xl border bg-slate-50 px-3"><Search className="h-4 w-4 text-slate-400" /><input value={aiSearch} onChange={(e) => setAiSearch(e.target.value)} placeholder="Search filename…" className="w-full bg-transparent py-2.5 text-sm outline-none" /></label><label className="flex items-center gap-2 rounded-xl border px-3"><ArrowUpDown className="h-4 w-4 text-slate-400" /><select value={aiSort} onChange={(e) => setAiSort(e.target.value)} className="bg-transparent py-2.5 text-sm font-semibold outline-none"><option value="newest">Newest first</option><option value="oldest">Oldest first</option><option value="name">Filename</option><option value="quality">Quality</option></select></label><button type="button" onClick={() => setAiListView((v) => !v)} className="rounded-xl border px-3 py-2 text-sm font-semibold">{aiListView ? 'Grid view' : 'List view'}</button></div><div className="mt-3 flex flex-wrap items-center justify-between gap-2 border-t pt-3"><p className="text-sm text-slate-600">Showing <b>{filteredPhotos.length}</b> of <b>{photoItems.length}</b> loaded photos{aiFilter !== 'all' ? <span> · <b className="capitalize">{aiFilter}</b></span> : null}</p>{(aiFilter !== 'all' || aiSearch) && <button type="button" onClick={() => { setAiFilter('all'); setAiSearch(''); }} className="text-xs font-bold text-[#E50914]">Clear filters</button>}</div></div>
+      {Number(aiSummary?.unscanned ?? 0) > 0 && <p className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">{aiSummary?.unscanned} photos have not been scanned yet. Newly completed uploads are queued automatically.</p>}
+      {filteredPhotos.length ? <div className={aiListView ? 'space-y-2' : 'grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5'}>{filteredPhotos.map((item) => <button type="button" key={item.id} onClick={() => void openMedia(item)} className={`group overflow-hidden rounded-xl border border-slate-200 bg-white text-left shadow-sm transition hover:-translate-y-0.5 hover:shadow-md ${aiListView ? 'flex items-center gap-3 p-2' : ''}`}><div className={aiListView ? 'h-16 w-16 shrink-0 overflow-hidden rounded-lg bg-slate-100' : 'aspect-[4/3] overflow-hidden bg-slate-100'}>{item.thumbnailUrl ? <img src={item.thumbnailUrl} alt={item.filename} loading="lazy" decoding="async" className="h-full w-full object-cover transition group-hover:scale-[1.03]" /> : <div className="grid h-full place-items-center text-xs text-slate-400">Preview unavailable</div>}</div><div className={aiListView ? 'min-w-0 flex-1 py-1 pr-2' : 'p-3'}><p className="truncate text-sm font-bold text-slate-900">{item.filename}</p><div className="mt-2 flex flex-wrap items-center gap-2"><span className={`rounded-full px-2.5 py-1 text-[11px] font-bold capitalize ${badgeFor(item)}`}>{labelFor(item)}</span>{item.aiAnalysis?.exposure && <span className="text-[11px] text-slate-500">Exposure: {String(item.aiAnalysis.exposure).replace('_', ' ')}</span>}</div>{item.aiAnalysis?.blurScore != null && <p className="mt-1 text-[11px] text-slate-400">Sharpness: {Number(item.aiAnalysis.blurScore).toFixed(1)}</p>}</div></button>)}</div> : <div className="rounded-2xl border border-dashed border-slate-300 bg-white px-5 py-12 text-center"><FileImage className="mx-auto h-9 w-9 text-slate-300" /><h3 className="mt-3 font-bold text-slate-800">No matching photos</h3><p className="mt-1 text-sm text-slate-500">Try another filter or clear your search.</p><button type="button" onClick={() => { setAiFilter('all'); setAiSearch(''); }} className="mt-3 text-sm font-bold text-[#E50914]">Show all photos</button></div>}
+      {mediaLoading && <p className="text-center text-sm text-slate-500">Loading photos…</p>}{mediaCursor && <div className="text-center"><button disabled={mediaLoading} onClick={() => void loadMoreMedia()} className="rounded-lg border px-4 py-2 text-sm font-semibold disabled:opacity-50">{mediaLoading ? 'Loading…' : 'Load more photos'}</button></div>}
+      <p className="text-xs text-slate-500">AI labels are review suggestions, not automatic deletion decisions. Blur and exposure thresholds are initial heuristics.</p>
+    </section>;
+  })()}
+  {tab === 'Guest Selections' && <section className="rounded-2xl border bg-white p-5"><div className="mb-4 grid gap-3 sm:grid-cols-3"><Metric title="Selected Photos" value={selections.length} /><Metric title="Selection Limit" value={settings?.photoSelectionLimit ?? 0} /><Metric title="Selection Progress" value={`${selections.length}/${settings?.photoSelectionLimit ?? 0}`} /></div><button disabled={busy || selections.length === 0} onClick={() => void downloadSelected()} className="mb-4 rounded-lg bg-[#E50914] px-4 py-2 text-sm font-bold text-white disabled:opacity-50">{busy ? 'Creating ZIP…' : 'Download Selected Originals'}</button><div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">{selections.map((m, i) => { return m ? <figure key={m.id} className="relative overflow-hidden rounded-xl border"><OptimizedAlbumImage src={m.thumbnailUrl ?? m.previewUrl} alt={m.filename} width={640} height={640} className="w-full" /><figcaption className="p-2 text-xs">#{i + 1} · {m.filename}</figcaption></figure> : null; })}</div><p className="mt-4 text-xs text-slate-500">Selections are grouped without guest identities. Download originals individually from All Media.</p></section>}
+  {tab === 'Album Settings' && <section className="max-w-3xl space-y-4">{[['Photo Selection Limit', 'photoSelectionLimit'], ['Album Expiration (days)', 'expirationDays']].map(([label, key]) => <label key={key} className="block rounded-xl border bg-white p-4 text-sm font-bold">{label}<input type="number" min="1" value={settings?.[key] ?? ''} onChange={(e) => setSettings({ ...settings, [key]: Number(e.target.value) })} className="mt-2 block w-full rounded-lg border px-3 py-2" /></label>)}<p className="text-sm text-slate-500">Album expires on {dateText(new Date((asDate(album.creationDate)?.getTime() ?? Date.now()) + Number(settings?.expirationDays ?? 0) * 86400000))}</p><Toggle title="Studio Watermark" checked={!!settings?.watermarkEnabled} onChange={(v) => setSettings({ ...settings, watermarkEnabled: v })} /><label className="block rounded-xl border bg-white p-4 text-sm">Watermark image<input type="file" accept="image/*" onChange={(e) => void uploadWatermark(e.target.files?.[0])} className="mt-2 block text-xs" />{watermarkUrl && <img src={watermarkUrl} alt="Watermark preview" className="mt-3 h-16 max-w-48 object-contain" />}</label><Toggle title="Guest Download Permission" checked={!!settings?.downloadEnabled} onChange={(v) => setSettings({ ...settings, downloadEnabled: v })} /><button disabled={busy || !canEdit} onClick={() => void saveSettings()} className="rounded-xl bg-[#E50914] px-5 py-3 font-bold text-white">{busy ? 'Saving…' : 'Save Settings'}</button></section>}
+  {tab === 'Share Album' && <section className="grid gap-5 lg:grid-cols-2"><AlbumShareManager albumId={album.id} /><div className="rounded-2xl border bg-white p-5"><h3 className="font-bold">Guest Preview</h3><div className="mx-auto mt-4 max-w-xs overflow-hidden rounded-[2rem] border-8 border-slate-900 bg-white"><div className="bg-[#410015] p-4 text-center font-black text-white">ON AIR</div><div className="p-4 text-center"><div className="grid h-36 place-items-center rounded-xl bg-rose-50 text-[#E50914]"><Album className="h-10 w-10" /></div><b className="mt-3 block">{album.albumName}</b><p className="mt-1 text-xs text-slate-500">{(album.photoCount ?? media.filter((m) => m.mediaType === 'photo').length)} photos · {(album.videoCount ?? media.filter((m) => m.mediaType === 'video').length)} videos</p><button className="mt-4 rounded-lg bg-[#E50914] px-4 py-2 text-xs font-bold text-white">View Album</button></div></div><p className="mt-4 text-xs text-slate-500">1. Share the link or QR. 2. Guests view previews and select photos. 3. Downloads follow your album settings.</p></div></section>}
+  {folderDialog && <div className="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4"><form onSubmit={(e) => void createFolder(e)} className="w-full max-w-sm rounded-2xl bg-white p-5"><h2 className="font-bold">Create Folder</h2><input autoFocus required value={folderName} onChange={(e) => setFolderName(e.target.value)} placeholder="Folder name" className="mt-4 w-full rounded-xl border px-3 py-2.5" /><div className="mt-4 flex justify-end gap-2"><button type="button" onClick={() => setFolderDialog(false)} className="rounded-lg border px-3 py-2">Cancel</button><button disabled={busy} className="rounded-lg bg-[#E50914] px-4 py-2 font-bold text-white">Create</button></div></form></div>}
+  {preview && <div className="fixed inset-0 z-50 grid place-items-center bg-black/90 p-4" onClick={() => setPreview(null)}><button className="absolute right-5 top-5 text-white"><X /></button>{preview.mediaType === 'video' ? <video src={preview.previewUrl} controls preload="none" className="max-h-[80vh] max-w-full" onClick={(e) => e.stopPropagation()} /> : <img src={preview.previewUrl} decoding="async" className="max-h-[80vh] max-w-full object-contain" />}</div>}
+  </div>;
+};
+
+function Metric({ title, value }: { title: string; value: React.ReactNode }) { return <div className="rounded-xl bg-slate-50 p-4"><p className="text-xs text-slate-500">{title}</p><b className="mt-1 block text-xl">{value}</b></div>; }
+function Toggle({ title, checked, onChange }: { title: string; checked: boolean; onChange: (value: boolean) => void }) { return <label className="flex items-center justify-between rounded-xl border bg-white p-4 text-sm font-semibold">{title}<input type="checkbox" checked={checked} onChange={(e) => onChange(e.target.checked)} className="h-5 w-5 accent-[#E50914]" /></label>; }
+type OptimizedAlbumImageProps = { src?: string | null; alt: string; width: number; height: number; sizes?: string; className?: string; fallback?: React.ReactNode };
+const OptimizedAlbumImage = React.memo(function OptimizedAlbumImage({ src, alt, width, height, sizes = '(max-width: 640px) 45vw, (max-width: 1024px) 30vw, 22vw', className = '', fallback }: OptimizedAlbumImageProps) {
+  const [loaded, setLoaded] = useState(false);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => { setLoaded(false); setFailed(false); }, [src]);
+  return <div className={`relative overflow-hidden bg-slate-100 ${className}`} style={{ aspectRatio: `${width} / ${height}` }}>
+    {!loaded && !failed && <div aria-hidden="true" className="absolute inset-0 animate-pulse bg-slate-200" />}
+    {src && !failed ? <img src={src} alt={alt} width={width} height={height} sizes={sizes} loading="lazy" decoding="async" onLoad={() => setLoaded(true)} onError={() => setFailed(true)} className={`absolute inset-0 h-full w-full object-cover transition-opacity duration-200 ${loaded ? 'opacity-100' : 'opacity-0'}`} /> : <div className="absolute inset-0 grid place-items-center text-slate-400">{fallback ?? <FileImage className="h-7 w-7" />}</div>}
+  </div>;
+});
+
+const MediaGrid = React.memo(function MediaGrid({ items, listView, mediaCursor, mediaLoading, selectedMediaIds, deletingMediaIds, onToggleSelection, onSelectAll, onDeleteSelected, onLoadMore, onOpen, onDownload, onDelete, onSetCover }: { items: Row[]; listView: boolean; mediaCursor: string | null; mediaLoading: boolean; selectedMediaIds: Set<string>; deletingMediaIds: Set<string>; onToggleSelection: (id: string) => void; onSelectAll: () => void; onDeleteSelected: () => void; onLoadMore: () => void; onOpen: (item: Row) => void; onDownload: (item: Row) => void; onDelete?: (item: Row) => void; onSetCover?: (item: Row) => void }) {
+  const loadMoreSentinel = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const node = loadMoreSentinel.current;
+    if (!node || !mediaCursor || mediaLoading || typeof IntersectionObserver === 'undefined') return;
+    const observer = new IntersectionObserver((entries) => {
+      if (entries.some((entry) => entry.isIntersecting)) onLoadMore();
+    }, { rootMargin: '500px' });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [mediaCursor, mediaLoading, onLoadMore]);
+  const visibleIds = items.map((item) => item.id);
+  const allSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedMediaIds.has(id));
+  const selectedCount = selectedMediaIds.size;
+  return <div>
+    <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2">
+      <label className="flex cursor-pointer items-center gap-2 text-xs font-semibold text-slate-700"><input type="checkbox" checked={allSelected} onChange={onSelectAll} disabled={!items.length || deletingMediaIds.size > 0} className="h-4 w-4 accent-[#E50914]" />Select all visible</label>
+      <div className="flex items-center gap-3"><span className="text-xs text-slate-500">{selectedCount} selected</span>{selectedCount > 0 && <button type="button" onClick={onDeleteSelected} disabled={deletingMediaIds.size > 0} className="rounded-md bg-[#E50914] px-3 py-1.5 text-xs font-bold text-white disabled:opacity-50">{deletingMediaIds.size ? `Deleting ${deletingMediaIds.size}…` : 'Delete selected'}</button>}</div>
+    </div>
+    {items.length ? <div className={listView ? 'space-y-2' : 'grid grid-cols-2 gap-2.5 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5'}>{items.map((m) => <article key={m.id} className={listView ? 'flex items-center gap-2 rounded-lg border bg-white p-2' : 'overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm'}>
+      <div className={listView ? 'relative h-12 w-12 shrink-0' : 'relative'}><button onClick={() => void onOpen(m)} disabled={deletingMediaIds.has(m.id)} className={listView ? 'h-12 w-12 overflow-hidden rounded-lg' : 'block w-full'}><OptimizedAlbumImage src={m.thumbnailUrl} alt={m.filename} width={640} height={640} className="h-full w-full" fallback={m.mediaType === 'video' ? <FileVideo className="h-7 w-7" /> : <FileImage className="h-7 w-7" />} /></button><label className="absolute left-1.5 top-1.5 grid h-6 w-6 cursor-pointer place-items-center rounded-md bg-white/95 shadow"><input type="checkbox" aria-label={`Select ${m.filename}`} checked={selectedMediaIds.has(m.id)} disabled={deletingMediaIds.has(m.id)} onChange={() => onToggleSelection(m.id)} className="h-4 w-4 accent-[#E50914]" /></label></div>
+      <div className="min-w-0 flex-1 p-2"><b className="block truncate text-xs">{m.filename}</b><small className="text-slate-500">{m.mediaType} · {bytesText(m.originalSizeBytes)}</small><div className="mt-2 flex items-center gap-1.5"><button type="button" onClick={() => onDownload(m)} disabled={deletingMediaIds.has(m.id)} aria-label={`Download original ${m.filename}`} title="Download original" className="grid h-8 w-8 place-items-center rounded-lg border border-slate-200 bg-white text-slate-600 transition hover:border-slate-300 hover:bg-slate-50 hover:text-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#E50914] disabled:cursor-not-allowed disabled:opacity-40"><Download className="h-4 w-4" /></button>{onSetCover && <button type="button" onClick={() => void onSetCover(m)} disabled={deletingMediaIds.has(m.id)} className="rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] font-semibold text-slate-600 hover:bg-slate-50 disabled:opacity-50">Set cover</button>}{onDelete && <button type="button" onClick={() => onDelete(m)} disabled={deletingMediaIds.has(m.id)} aria-label={deletingMediaIds.has(m.id) ? `Deleting ${m.filename}` : `Delete ${m.filename}`} title={deletingMediaIds.has(m.id) ? 'Deleting…' : 'Delete'} className="grid h-8 w-8 place-items-center rounded-lg border border-red-100 bg-white text-red-600 transition hover:border-red-200 hover:bg-red-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 disabled:cursor-not-allowed disabled:opacity-40">{deletingMediaIds.has(m.id) ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}</button>}</div></div>
+    </article>)}</div> : <p className="rounded-xl border border-dashed p-7 text-center text-sm text-slate-500">No media in this view yet.</p>}
+    {mediaCursor && <><div ref={loadMoreSentinel} aria-hidden="true" className="h-px" /><button onClick={onLoadMore} disabled={mediaLoading} className="mx-auto mt-4 block rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-700 shadow-sm disabled:opacity-60">{mediaLoading ? 'Loading media…' : 'Load 40 more'}</button></>}
+  </div>;
+});

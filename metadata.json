@@ -1,0 +1,6 @@
+{
+  "name": "ON AIR – Studio Panel",
+  "description": "Premium SaaS dashboard for wedding photography studios to manage events, AI photo sharing, live streaming, highlights, wallet, guest pages, and training.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
