@@ -22,7 +22,12 @@ import {
 // Also import from react-icons as requested by user prompt
 import { RiBroadcastLine } from 'react-icons/ri';
 
-export const Sidebar: React.FC = () => {
+interface SidebarProps {
+  isMobileOpen: boolean;
+  onMobileClose: () => void;
+}
+
+export const Sidebar: React.FC<SidebarProps> = ({ isMobileOpen, onMobileClose }) => {
   const {
     activeTab,
     setActiveTab,
@@ -65,14 +70,16 @@ export const Sidebar: React.FC = () => {
   });
 
   return (
-    <aside
-      className={`relative flex flex-col shrink-0 bg-[#111116] text-white transition-all duration-300 select-none z-30 border-r border-[#1F1F28] ${
-        isSidebarCollapsed ? 'w-20' : 'w-64'
-      } h-screen sticky top-0 overflow-hidden`}
+    <>
+      {isMobileOpen && <button aria-label="Close navigation" onClick={onMobileClose} className="fixed inset-0 z-30 bg-black/50 md:hidden" />}
+      <aside
+      className={`fixed inset-y-0 left-0 z-40 flex h-screen w-[min(18rem,85vw)] shrink-0 flex-col overflow-hidden border-r border-[#1F1F28] bg-[#111116] text-white transition-all duration-300 select-none md:sticky md:top-0 md:z-30 md:h-screen ${
+        isMobileOpen ? 'translate-x-0' : '-translate-x-full'
+      } md:translate-x-0 ${isSidebarCollapsed ? 'md:w-20' : 'md:w-64'}`}
     >
       {/* Sidebar Header / Logo */}
       <div className="pt-6 pb-4 px-4 flex flex-col items-center justify-center border-b border-white/5 relative">
-        <div className="flex items-center gap-2 cursor-pointer" onClick={() => setActiveTab('dashboard')}>
+        <div className="flex items-center gap-2 cursor-pointer" onClick={() => { setActiveTab('dashboard'); onMobileClose(); }}>
           <span className="font-extrabold tracking-tight text-2xl text-white flex items-center gap-1.5">
             ON AIR
             <RiBroadcastLine className="text-[#F20D24] text-2xl -mt-1" />
@@ -90,7 +97,7 @@ export const Sidebar: React.FC = () => {
         {/* Toggle Collapse Button */}
         <button
           onClick={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
-          className="absolute -right-3 top-7 w-6 h-6 rounded-full bg-[#1E1E24] border border-gray-700 text-gray-300 hover:text-white flex items-center justify-center text-xs shadow-md transition-transform hover:scale-110 z-40"
+          className="absolute -right-3 top-7 hidden h-6 w-6 items-center justify-center rounded-full border border-gray-700 bg-[#1E1E24] text-xs text-gray-300 shadow-md transition-transform hover:scale-110 z-40 md:flex"
           title={isSidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
         >
           {isSidebarCollapsed ? <ChevronRight className="w-3.5 h-3.5" /> : <ChevronLeft className="w-3.5 h-3.5" />}
@@ -104,29 +111,29 @@ export const Sidebar: React.FC = () => {
           return (
             <button
               key={item.id}
-              onClick={() => setActiveTab(item.id)}
+              onClick={() => { setActiveTab(item.id); onMobileClose(); }}
               className={`w-full flex items-center gap-3.5 px-3.5 py-3 rounded-xl text-sm font-medium transition-all duration-200 group relative ${
                 isActive
                   ? 'bg-[#F20D24] text-white shadow-md shadow-red-950/40 font-semibold'
                   : 'text-gray-400 hover:text-white hover:bg-white/5'
-              } ${isSidebarCollapsed ? 'justify-center px-2' : ''}`}
+                } ${isSidebarCollapsed ? 'md:justify-center md:px-2' : ''}`}
               title={isSidebarCollapsed ? item.label : undefined}
             >
               <span className={`transition-colors ${isActive ? 'text-white' : 'text-gray-400 group-hover:text-white'}`}>
                 {item.icon}
               </span>
 
-              {!isSidebarCollapsed && (
+              {(!isSidebarCollapsed || isMobileOpen) && (
                 <span className="truncate flex-1 text-left">{item.label}</span>
               )}
 
-              {item.badge && !isSidebarCollapsed && (
+              {item.badge && (!isSidebarCollapsed || isMobileOpen) && (
                 <span className="ml-auto bg-white text-[#F20D24] text-[10px] font-bold px-2 py-0.5 rounded-full">
                   {item.badge}
                 </span>
               )}
 
-              {item.badge && isSidebarCollapsed && (
+              {item.badge && isSidebarCollapsed && !isMobileOpen && (
                 <span className="absolute top-2 right-2 w-2 h-2 rounded-full bg-[#F20D24]" />
               )}
             </button>
@@ -141,6 +148,7 @@ export const Sidebar: React.FC = () => {
           <path d="M0,60 C40,90 100,20 200,80 L200,120 L0,120 Z" />
         </svg>
       </div>
-    </aside>
+      </aside>
+    </>
   );
 };

@@ -11,11 +11,12 @@ import {
   RotateCcw,
   Sparkles,
   LogOut,
+  Menu,
 } from 'lucide-react';
 import { signOut } from 'firebase/auth';
 import { auth } from '../../Firebase';
 
-export const Header: React.FC = () => {
+export const Header: React.FC<{ onMenuClick: () => void }> = ({ onMenuClick }) => {
   const {
     profile,
     announcements,
@@ -48,20 +49,23 @@ export const Header: React.FC = () => {
   }, []);
 
   return (
-    <header className="sticky top-0 z-20 bg-white/95 backdrop-blur-md border-b border-[#E7E9F0] px-6 py-4 flex items-center justify-between shadow-2xs">
+    <header className="sticky top-0 z-20 bg-white/95 backdrop-blur-md border-b border-[#E7E9F0] px-3 py-3 sm:px-6 sm:py-4 flex items-center justify-between gap-3 shadow-2xs">
       {/* Left: Dynamic Welcome message */}
-      <div>
-        <h1 className="text-xl md:text-2xl font-bold text-[#171717] flex items-center gap-2">
+      <div className="flex min-w-0 items-center gap-2">
+        <button onClick={onMenuClick} aria-label="Open navigation" className="grid h-10 w-10 shrink-0 place-items-center rounded-lg border border-[#E7E9F0] text-gray-700 md:hidden"><Menu className="h-5 w-5" /></button>
+        <div className="min-w-0">
+        <h1 className="text-base sm:text-xl md:text-2xl font-bold text-[#171717] flex items-center gap-2 truncate">
           Welcome Back, {profile.studioName}
           <span className="text-xl">👋</span>
         </h1>
-        <p className="text-xs md:text-sm text-[#737783] mt-0.5">
+        <p className="hidden sm:block text-xs md:text-sm text-[#737783] mt-0.5 truncate">
           Manage your events, photo sharing and live streaming in one place.
         </p>
+        </div>
       </div>
 
       {/* Right Controls */}
-      <div className="flex items-center gap-3">
+      <div className="flex shrink-0 items-center gap-2 sm:gap-3">
         {/* Super Admin Toggle Pill */}
        
 

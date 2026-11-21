@@ -30,6 +30,7 @@ import { GuestWebsitePreviewModal } from './components/guest-preview/GuestWebsit
 import { AlbumSelectionPage } from './components/albums/AlbumSelectionPage';
 
 const AppContent: React.FC = () => {
+  const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false);
   const {
     activeTab,
     showCreateEventModal,
@@ -53,11 +54,11 @@ const AppContent: React.FC = () => {
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-[#F7F8FC] text-[#171717] antialiased">
       {/* Persistent Left Sidebar */}
-      <Sidebar />
+      <Sidebar isMobileOpen={isMobileSidebarOpen} onMobileClose={() => setIsMobileSidebarOpen(false)} />
 
       {/* Main Content Area */}
       <div className="flex-1 flex flex-col min-w-0 h-screen overflow-y-auto">
-        <Header />
+        <Header onMenuClick={() => setIsMobileSidebarOpen(true)} />
 
         <main className="flex-1 p-4 sm:p-6 lg:p-8 max-w-7xl w-full mx-auto pb-16">
           {restrictedFeature ? (
