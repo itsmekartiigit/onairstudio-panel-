@@ -232,6 +232,7 @@ export interface UploadedPhoto {
   sizeMB: number;
   uploadedAt: string;
   storagePath?: string;
+  storageProvider?: 'firebase' | 'r2';
   publicEventSlug?: string;
   facesDetected?: number;
   tags?: string[];

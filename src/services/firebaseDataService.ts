@@ -44,6 +44,9 @@ export async function indexStudioPhoto(
   success: boolean;
   photoId: string;
   facesDetected: number;
+  indexDocumentsWritten: number;
+  indexDocumentsVerified: number | null;
+  failureReason: string | null;
   indexStatus: string;
 }> {
   if (!activeUid) {
@@ -60,6 +63,9 @@ export async function indexStudioPhoto(
       success: boolean;
       photoId: string;
       facesDetected: number;
+      indexDocumentsWritten: number;
+      indexDocumentsVerified: number | null;
+      failureReason: string | null;
       indexStatus: string;
     }
   >(functions, 'indexStudioPhoto');
@@ -215,9 +221,26 @@ export async function persistStudioPhotos(
 
 export async function removeStudioPhoto(photo: UploadedPhoto): Promise<void> {
   if (!activeUid) return;
-  if (photo.storagePath) {
-    await deleteObject(ref(storage, photo.storagePath));
+  if (!photo.storagePath) return;
+  if (!auth.currentUser || auth.currentUser.uid !== activeUid) {
+    throw new Error('Your studio sign-in is required to remove photos.');
   }
+
+  const removePhoto = httpsCallable<
+    {
+      eventId: string;
+      photoId: string;
+      storagePath: string;
+      storageProvider?: 'firebase' | 'r2';
+    },
+    { success: boolean }
+  >(functions, 'deleteStudioPhoto');
+  await removePhoto({
+    eventId: photo.eventId,
+    photoId: photo.id,
+    storagePath: photo.storagePath,
+    storageProvider: photo.storageProvider,
+  });
 }
 
 export async function uploadEventPhoto(
@@ -287,32 +310,56 @@ export async function uploadEventThumbnail(
   eventId: string,
   file: File,
 ): Promise<{ url: string; storagePath: string }> {
-  if (!activeUid) throw new Error('You must be signed in to upload event thumbnails.');
-  if (auth.currentUser?.uid !== activeUid) {
-    throw new Error('Your studio sign-in expired or changed. Sign out and sign back in before uploading.');
+  const uid = auth.currentUser?.uid;
+
+  if (!activeUid || !uid) {
+    throw new Error('You must be signed in to upload event thumbnails.');
   }
-  if (!file.type.startsWith('image/')) throw new Error('Event thumbnail must be an image.');
-  if (file.size > 20 * 1024 * 1024) throw new Error('Event thumbnail must be 20 MB or smaller.');
+
+  if (uid !== activeUid) {
+    throw new Error('Studio UID mismatch. Please sign in again.');
+  }
+
+  if (!file.type.startsWith('image/')) {
+    throw new Error('Event thumbnail must be an image.');
+  }
+
+  if (file.size > 20 * 1024 * 1024) {
+    throw new Error('Event thumbnail must be 20 MB or smaller.');
+  }
 
   const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
-  const storagePath = `studioUploads/${activeUid}/events/${eventId}/thumbnail_${crypto.randomUUID()}_${safeName}`;
+  const storagePath = `studioUploads/${uid}/events/${eventId}/thumbnail_${crypto.randomUUID()}_${safeName}`;
   const storageRef = ref(storage, storagePath);
+
+  console.log('[THUMBNAIL DEBUG]', {
+    bucket: storage.app.options.storageBucket,
+    uid,
+    activeUid,
+    storagePath,
+    contentType: file.type,
+    size: file.size,
+  });
 
   try {
     await uploadBytes(storageRef, file, { contentType: file.type });
-    return { url: await getDownloadURL(storageRef), storagePath };
   } catch (error) {
-    if (
-      typeof error === 'object'
-      && error !== null
-      && 'code' in error
-      && error.code === 'storage/unauthorized'
-    ) {
-      throw new Error(
-        'Firebase Storage denied this upload. Publish the studioUploads Storage rules from storage.rules and confirm you are signed into the matching studio account.',
-      );
-    }
-    throw new Error(`Could not upload event thumbnail: ${getErrorMessage(error)}`);
+    console.error('[THUMBNAIL UPLOAD FAILED]', error);
+    throw new Error(`Thumbnail upload failed: ${getErrorMessage(error)}`);
+  }
+
+  console.log('[THUMBNAIL] Upload succeeded. Getting download URL.');
+
+  try {
+    const url = await getDownloadURL(storageRef);
+    console.log('[THUMBNAIL] Download URL retrieved successfully.');
+
+    return { url, storagePath };
+  } catch (error) {
+    console.error('[THUMBNAIL DOWNLOAD URL FAILED]', error);
+    throw new Error(
+      `Thumbnail uploaded, but download URL retrieval failed: ${getErrorMessage(error)}`,
+    );
   }
 }
 

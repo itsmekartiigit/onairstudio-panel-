@@ -621,6 +621,7 @@ export const StudioProvider: React.FC<{
     storageService.saveEvents(updatedEvents);
 
     let indexed = 0;
+    let noFaces = 0;
     let indexingFailed = 0;
     console.log('[AI INDEX] Upload completed:', uploaded.length);
     console.log('[AI INDEX] Event:', event.id);
@@ -633,8 +634,13 @@ export const StudioProvider: React.FC<{
         try {
           const result = await indexStudioPhoto(eventId, photo.id);
           if (result.success) {
-            indexed += 1;
-            console.log('[AI INDEX] SUCCESS:', photo.id, result);
+            if (result.indexStatus === 'no_faces' || result.facesDetected === 0) {
+              noFaces += 1;
+              console.info('[AI INDEX] NO FACES:', photo.id, result);
+            } else {
+              indexed += 1;
+              console.log('[AI INDEX] SUCCESS:', photo.id, result);
+            }
           } else {
             indexingFailed += 1;
             console.error('[AI INDEX] FAILED:', photo.id, result);
@@ -648,7 +654,7 @@ export const StudioProvider: React.FC<{
 
     if (failures.length > 0) {
       const indexingSummary = event.services?.aiPhotoSharing
-        ? ` ${indexed} AI indexed; ${indexingFailed} need AI indexing retry.`
+        ? ` ${indexed} indexed; ${noFaces} had no faces; ${indexingFailed} need AI indexing retry.`
         : '';
       notify(
         `${uploaded.length} photos uploaded; ${failures.length} could not be uploaded.${indexingSummary}`,
@@ -659,7 +665,12 @@ export const StudioProvider: React.FC<{
       });
     } else if (event.services?.aiPhotoSharing && indexingFailed > 0) {
       notify(
-        `${uploaded.length} photos uploaded. ${indexed} AI indexed; ${indexingFailed} need AI indexing retry.`,
+        `${uploaded.length} photos uploaded. ${indexed} indexed; ${noFaces} had no faces; ${indexingFailed} need AI indexing retry.`,
+        'info',
+      );
+    } else if (event.services?.aiPhotoSharing && noFaces > 0) {
+      notify(
+        `${uploaded.length} photos uploaded. ${indexed} indexed; ${noFaces} had no faces detected.`,
         'info',
       );
     } else if (event.services?.aiPhotoSharing) {
@@ -691,7 +702,7 @@ export const StudioProvider: React.FC<{
       setEventsState(updatedEvents);
       notify('Photo removed from event gallery', 'info');
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Firebase could not remove this photo.';
+      const message = error instanceof Error ? error.message : 'The photo could not be removed.';
       notify(`Could not remove photo: ${message}`, 'error');
     }
   };
